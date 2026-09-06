@@ -1156,6 +1156,31 @@ class TestUtils(base.BasePyTestCase):
             util.cmd('false', raise_on_error=True)
         assert str(exc.value) == "f a l s e returned a non-0 exit code: 1"
 
+    def test_cmd_closes_pipes_when_communicate_raises(self):
+        """The child's stdout and stderr should be closed even if communicate() raises.
+
+        Otherwise the Popen object is abandoned with its pipes still open, and CPython parks the
+        still running child in subprocess._active, which holds both descriptors for the lifetime
+        of this process.
+        """
+        processes = []
+
+        class RecordingPopen(subprocess.Popen):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                processes.append(self)
+
+            def communicate(self, *args, **kwargs):
+                raise OSError('The pipes, the pipes are calling.')
+
+        with mock.patch('bodhi.server.util.subprocess.Popen', RecordingPopen):
+            with pytest.raises(OSError):
+                util.cmd(['true'])
+
+        assert len(processes) == 1
+        assert processes[0].stdout.closed
+        assert processes[0].stderr.closed
+
     def test_sorted_updates_async_removal(self):
         u1 = self.create_update(['bodhi-1.0-1.fc24', 'somepkg-2.0-3.fc24'])
         u2 = self.create_update(['somepkg-1.0-3.fc24'])

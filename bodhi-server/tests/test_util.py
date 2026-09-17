@@ -419,6 +419,57 @@ class TestSanityCheckRepodata(base.BasePyTestCase):
             util.sanity_check_repodata(self.tempdir, repo_type='yum', drpms=False)
         assert str(exc.value) == "Error loading the repository: Exception message"
 
+    def test_load_repo_libdnf5_uses_subprocess(self):
+        """load_repo_libdnf5() must run the repo check in a child process.
+
+        libsolv holds file descriptors against repo metadata that are not
+        released when the Python Base object goes out of scope. Running in a
+        subprocess guarantees the OS reclaims them on exit.
+        See https://github.com/fedora-infra/bodhi/issues/5935.
+        """
+        pytest.importorskip('libdnf5', reason='libdnf5 is not installed')
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch('bodhi.server.util.subprocess.run') as mock_run:
+                mock_run.return_value = mock.Mock(returncode=0)
+                result = util.load_repo_libdnf5(td, 'file:///some/repo')
+        assert result is True
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args[0] == sys.executable
+        assert args[1] == '-c'
+
+    def test_load_repo_libdnf5_child_failure_raises(self):
+        """A non-zero child exit should raise RepodataException."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch('bodhi.server.util.subprocess.run') as mock_run:
+                mock_run.return_value = mock.Mock(
+                    returncode=1,
+                    stderr=b'AssertionError: expected 1 repo, got 0',
+                )
+                with pytest.raises(util.RepodataException) as exc:
+                    util.load_repo_libdnf5(td, 'file:///bad/repo')
+        assert 'expected 1 repo, got 0' in str(exc.value)
+
+    def test_load_repo_libdnf5_no_fd_leak(self):
+        """load_repo_libdnf5() must not leave open descriptors in the caller.
+
+        The subprocess approach is what guarantees this; this test catches any
+        regression that moves the libdnf5 work back in-process.
+        """
+        pytest.importorskip('libdnf5', reason='libdnf5 is not installed')
+        import tempfile
+        fds_before = set(os.listdir('/proc/self/fd'))
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch('bodhi.server.util.subprocess.run') as mock_run:
+                mock_run.return_value = mock.Mock(returncode=0)
+                util.load_repo_libdnf5(td, 'file:///some/repo')
+        import gc
+        gc.collect()
+        leaked = set(os.listdir('/proc/self/fd')) - fds_before
+        assert not leaked, f"load_repo_libdnf5() leaked descriptors: {leaked}"
+
     def test_correct_yum_repo_with_gz_compress(self):
         """No Exception should be raised if the repo is normal.
 

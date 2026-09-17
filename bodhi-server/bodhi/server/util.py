@@ -35,6 +35,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import types
@@ -60,7 +61,7 @@ from bodhi.server.config import config
 from bodhi.server.exceptions import RepodataException
 
 try:
-    import libdnf5
+    import libdnf5 as _libdnf5_probe  # noqa: F401 -- presence-check only
     use_libdnf5 = True
 except ImportError:
     use_libdnf5 = False
@@ -397,9 +398,39 @@ def sanity_check_repodata_dnf(tempdir, myurl, *dnf_args):
     return subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.STDOUT)
 
 
+_LIBDNF5_CHILD = '''\
+import sys
+import libdnf5
+tempdir, myurl = sys.argv[1], sys.argv[2]
+base = libdnf5.base.Base()
+base_config = base.get_config()
+base_config.plugins = False
+base_config.cachedir = tempdir
+base.setup()
+repo_sack = base.get_repo_sack()
+repo = repo_sack.create_repo("testrepo")
+repo.get_config().baseurl = myurl
+repo_sack.load_repos(libdnf5.repo.Repo.Type_AVAILABLE)
+query = libdnf5.repo.RepoQuery(base)
+query.filter_enabled(True)
+repos = [r.get_id() for r in query]
+assert len(repos) == 1, f"expected 1 repo, got {len(repos)}"
+assert repos[0] == "testrepo", f"unexpected repo id {repos[0]!r}"
+'''
+
+
 def load_repo_libdnf5(tempdir, myurl):
     """
     Use libdnf5 python bindings to try to load a repository.
+
+    The check is run in a subprocess rather than in-process because libsolv
+    (the library underlying libdnf5) holds file descriptors against the repo
+    metadata files that are not released when the Base object goes out of scope
+    in Python -- they persist until the process exits. A long-lived celery
+    worker that runs sanity_check_repodata() across many composes therefore
+    accumulates hundreds of open descriptors per worker lifetime. Running in a
+    subprocess guarantees that the OS reclaims them when the child exits.
+    See https://github.com/fedora-infra/bodhi/issues/5935.
 
     Args:
         tempdir (str): Temporary directory for libdnf cache.
@@ -407,20 +438,15 @@ def load_repo_libdnf5(tempdir, myurl):
     Raises:
         Exception: If the repodata is not valid or does not exist.
     """
-    base = libdnf5.base.Base()
-    base_config = base.get_config()
-    base_config.plugins = False
-    base_config.cachedir = tempdir
-    base.setup()
-    repo_sack = base.get_repo_sack()
-    repo = repo_sack.create_repo("testrepo")
-    repo.get_config().baseurl = myurl
-    repo_sack.load_repos(libdnf5.repo.Repo.Type_AVAILABLE)
-    query = libdnf5.repo.RepoQuery(base)
-    query.filter_enabled(True)
-    repos = [r.get_id() for r in query]
-    assert len(repos) == 1
-    assert repos[0] == 'testrepo'
+    proc = subprocess.run(
+        [sys.executable, '-c', _LIBDNF5_CHILD, tempdir, myurl],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        raise RepodataException(
+            f'Error loading the repository: {proc.stderr.decode(errors="replace").strip()}'
+        )
     return True
 
 
